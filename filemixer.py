@@ -439,6 +439,20 @@ def _probe_kind(path):
     except (OSError, subprocess.TimeoutExpired):
         return None
     kinds = [l.split(",")[0] for l in out.strip().splitlines() if l]
+    if "video" in kinds and "audio" in kinds:
+        # an mp3/flac with embedded cover art reports a video stream too —
+        # if the only video is an attached picture, this is an audio file
+        try:
+            disp = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v",
+                 "-show_entries", "stream_disposition=attached_pic",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=15).stdout
+            if disp.strip() and all(x.strip() == "1"
+                                    for x in disp.strip().splitlines()):
+                return "audio"
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     if "video" in kinds:
         # ffprobe calls still images "video" too (a PNG reports 25 fps!),
         # so use the container duration to tell them apart
@@ -646,6 +660,47 @@ def datamosh(paths, out_path, intensity=60.0, seed=0, on_progress=None):
             os.remove(tmp)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# CURSE — the full ritual in one call: remix real content together, sprinkle
+# raw byte shrapnel over it, then datamosh the survivors so the decoder's
+# hallucinations get baked into real frames and smeared. Playable at the end.
+# ---------------------------------------------------------------------------
+
+def curse(paths, out_path, intensity=70.0, seed=0, on_progress=None):
+    if _probe_kind(paths[0]) != "video":
+        raise ValueError("the curse needs the first file to be a video")
+    t1 = out_path + ".c1.mp4"
+    t2 = out_path + ".c2.mp4"
+    part = (lambda lo, hi: (lambda f: on_progress(lo + f * (hi - lo))))         if on_progress else (lambda lo, hi: None)
+    try:
+        # stage 1: remix everything into the video (real decoded content)
+        remix(paths, t1, intensity=intensity, seed=seed,
+              on_progress=part(0.0, 0.55))
+        # stage 2: raw byte shrapnel, low dose so the decoder survives
+        shrapnel = max(0.5, min(intensity / 25, 4.0))
+        write_smash([t1] + paths[1:], t2, mode="sprinkle",
+                    intensity=shrapnel, seed=seed)
+        src = t2 if probe_playable(t2) else t1
+        if on_progress:
+            on_progress(0.6)
+        # stage 3: datamosh — re-encoding bakes the shrapnel hallucinations
+        # into real frames, then the keyframe drops smear them around
+        try:
+            datamosh([src] + paths[1:], out_path, intensity=intensity,
+                     seed=seed, on_progress=part(0.6, 1.0))
+        except RuntimeError:
+            if src == t1:
+                raise
+            datamosh([t1] + paths[1:], out_path, intensity=intensity,
+                     seed=seed, on_progress=part(0.6, 1.0))
+    finally:
+        for t in (t1, t2):
+            try:
+                os.remove(t)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +941,7 @@ def main(argv=None):
         description="Smash the raw bytes of two or more files together and "
                     "play the wreckage.")
     p.add_argument("files", nargs="+", help="two or more files to smash")
-    p.add_argument("-m", "--mode", choices=MODES + ("remix", "datamosh"),
+    p.add_argument("-m", "--mode", choices=MODES + ("remix", "datamosh", "curse"),
                    default="interleave",
                    help="remix = decode the files and splice the others' content "
                         "into the first (always playable); everything else is a "
@@ -938,6 +993,14 @@ def main(argv=None):
             return 1
         print(f"FAKE '{args.preset}' render of {args.files[0]} -> {out}  "
               f"({os.path.getsize(out):,} bytes - always playable, no real smashing)")
+    elif args.mode == "curse":
+        try:
+            curse(args.files, out, intensity=args.intensity, seed=args.seed)
+        except (ValueError, RuntimeError) as e:
+            print(f"the curse failed: {e}", file=sys.stderr)
+            return 1
+        print(f"CURSED {args.files[0]} with {len(args.files) - 1} offering(s) -> {out}  "
+              f"({os.path.getsize(out):,} bytes - remixed, shrapneled, moshed)")
     elif args.mode == "datamosh":
         try:
             datamosh(args.files, out, intensity=args.intensity, seed=args.seed)

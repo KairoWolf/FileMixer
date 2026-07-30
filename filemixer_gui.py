@@ -217,7 +217,7 @@ class FileMixerApp:
         tk.Label(r1, text="Mode:", bg=BG, fg=FG).pack(side="left")
         self.mode_var = tk.StringVar(value="interleave")
         ttk.Combobox(r1, textvariable=self.mode_var, state="readonly", width=13,
-                     values=list(fm.MODES) + ["remix", "datamosh"]).pack(side="left", padx=4)
+                     values=list(fm.MODES) + ["remix", "datamosh", "curse"]).pack(side="left", padx=4)
         self.mode_hint = tk.Label(real, text="", bg=BG, fg="#888", font=("Sans", 8),
                                   anchor="w", justify="left", wraplength=340)
         self.mode_hint.pack(fill="x", padx=8)
@@ -310,6 +310,8 @@ class FileMixerApp:
                  "content, always playable (photo chunks flashing in a video!)",
         "datamosh": "the BAD WIFI smear: real keyframe packets yeeted from the "
                     "stream so frames melt into each other - and it still plays",
+        "curse": "THE FULL RITUAL: remix + byte shrapnel + datamosh in one go. "
+                 "maximum cursed, still playable. video as File A required",
     }
 
     def _update_hint(self):
@@ -413,7 +415,7 @@ class FileMixerApp:
         if self.busy:
             return
         mode = self.mode_var.get()
-        if mode in ("remix", "datamosh"):
+        if mode in ("remix", "datamosh", "curse"):
             self._start_render(mode)
             return
         out = self._output_path("")
@@ -491,7 +493,8 @@ class FileMixerApp:
             self._start_render("fake")
 
     def _start_render(self, kind):
-        prefix = {"fake": "fake_", "remix": "remix_", "datamosh": "mosh_"}[kind]
+        prefix = {"fake": "fake_", "remix": "remix_", "datamosh": "mosh_",
+                  "curse": "CURSED_"}[kind]
         out = fm.mp4_safe(self._output_path(prefix), self.path_a)
         if not self._confirm_overwrite(out):
             return
@@ -509,6 +512,13 @@ class FileMixerApp:
             work = lambda: fm.fake_glitch(self.paths(), out,
                                           intensity=self.intensity_var.get(),
                                           preset=preset, on_progress=prog)
+        elif kind == "curse":
+            self._console_write(">> THE RITUAL BEGINS :: remix -> shrapnel -> "
+                                "datamosh :: may whatever comes out forgive us")
+            desc = "the curse"
+            work = lambda: fm.curse(self.paths(), out,
+                                    intensity=self.intensity_var.get(),
+                                    on_progress=prog)
         elif kind == "datamosh":
             self._console_write(">> DATAMOSH :: yeeting keyframes from the real "
                                 "stream :: prepare to smear")

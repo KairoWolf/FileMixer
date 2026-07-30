@@ -98,6 +98,7 @@ Outputs land next to the scripts as `mashed_*`, `mosh_*`, `remix_*`,
 | `xor` / `add` / `subtract` / `and` / `or` / `rotate` / `blend` | byte math folded across all files' overlapping bytes |
 | `datamosh` | the BAD WIFI smear: real keyframe packets deleted from the stream so frames melt and smear into each other — and it still plays |
 | `remix` | the special one: **decodes** the files and splices real content into file 1 — photo chunks flashing inside a video, audio bursts invading a song, PDF bytes as noise — always playable |
+| `curse` | **the full ritual**: remix + byte shrapnel + datamosh chained in one go. Maximum cursed, still playable. Video as file 1 required |
 
 ## The FAKE ZONE (level 0 — nothing here is real)
 
@@ -122,6 +123,7 @@ python3 filemixer.py a.mp4 b.png c.mp3 -m shuffle      # three files at once
 python3 filemixer.py vid.mp4 x.png -m sprinkle -i 8    # super glitchy, still plays
 python3 filemixer.py vid.mp4 x.png -m datamosh -i 80   # the bad-wifi smear
 python3 filemixer.py vid.mp4 x.png -m remix -i 40      # real content, always plays
+python3 filemixer.py vid.mp4 x.png y.mp3 -m curse -i 75 # the full ritual
 python3 filemixer.py vid.mp4 x.png --fake --preset backrooms
 python3 filemixer.py a b -m xor --play force-video     # byte soup -> crazy video
 python3 filemixer.py --help
