@@ -1,0 +1,19 @@
+# generated wreckage — outputs stay local
+mashed_*
+mosh_*
+remix_*
+fake_*
+CURSED_*
+SAVED_*
+*.forced.mp4
+*.rawsound.wav
+*.gop.mp4
+*.step*.mp4
+
+# personal input piles and generated test media
+filestotry/
+testfiles/
+
+# python
+__pycache__/
+*.pyc
