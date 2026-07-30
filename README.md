@@ -33,6 +33,15 @@ real modes literally mix the actual bytes of your files.
 |---|---|---|
 | ![loaded](docs/img/01_loaded.png) | ![interleave](docs/img/03_interleave_live.png) | ![done](docs/img/04_done.png) |
 
+### Featured example: The Abomination
+
+![the abomination](docs/img/abomination_preview.gif)
+
+Five files — a meme video, *Go Kitty Go!*, a JPEG, an mp3, and a TERMS OF
+SERVICE PDF — remixed, shrapneled, and datamoshed into one still-playable
+video. **[Watch the full video](docs/the_abomination.mp4)** and read
+**[exactly how it was made](docs/THE_ABOMINATION.md)**, step by step.
+
 ### What the wreckage looks like
 
 | FORCE VIDEO (bytes as pixels+sound) | datamosh smear | remix flash |
