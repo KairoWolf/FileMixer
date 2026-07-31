@@ -86,7 +86,7 @@ class Decoder:
         self.h = max(2, int(width * h / w)) // 2 * 2
         self.fps = 20
         self.proc = popen(
-            ["ffmpeg", "-nostdin", "-v", "error", "-stream_loop", "-1",
+            ["ffmpeg", "-nostdin", "-v", "error", "-re", "-stream_loop", "-1",
              "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24",
              "-vf", f"scale={self.w}:{self.h},fps={self.fps}", "pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -303,12 +303,16 @@ class AudioMangler(threading.Thread):
             arr = np.frombuffer(raw, dtype=np.int16).copy()
             chaos = 0 if self.app.real else self.app.chaos.get() / 100
             try:
-                if (not self.app.real and self.app.fuel
+                if (not self.app.real
                         and time.monotonic() < self.app.audio_blast_until):
-                    # a chuck is landing: the file's bytes hit the speakers
-                    _, fb = self.app.fuel.grab(len(arr), self.rng)
-                    blast = (fb.astype(np.int16) - 128) * 90  # 8-bit scream
-                    arr = (arr // 2 + blast // 2).astype(np.int16)
+                    # movie glitch: the sound machine-gun stutters and drops
+                    if self.prev is not None:
+                        piece = self.prev[: max(len(self.prev) // 4, 1)]
+                        arr = np.tile(piece, 4)[: len(arr)].copy()
+                    if self.rng.random() < 0.4:
+                        arr[: len(arr) // 2] = 0          # dropout
+                    shift = 6
+                    arr = ((arr >> shift) << shift).astype(np.int16)
                 elif chaos > 0.05 and self.rng.random() < chaos * 0.4:
                     shift = 4 + int(chaos * 7)               # bitcrush
                     arr = ((arr >> shift) << shift).astype(np.int16)
@@ -348,6 +352,11 @@ class LiveReactor:
         self.frames = 0
         self.running = False
         self.audio_blast_until = 0.0
+
+        # cinematic burst engine
+        self.burst = 0              # frames of glitch remaining
+        self.burst_pos = (0, 0)
+        self.frozen = None          # the stuck frame during a freeze
 
         # session telemetry
         self.undo_stack = []
@@ -574,7 +583,9 @@ class LiveReactor:
         self.score_mb += mb
         self.events += 1
         self.shake = 3
-        self.audio_blast_until = time.monotonic() + 0.4
+        self.burst = self.rng.randint(8, 14)
+        self.frozen = None
+        self.audio_blast_until = time.monotonic() + 0.5
         self.hud_score.config(
             text=f"injected {self.score_mb:.1f} MB | {self.events} events")
 
@@ -627,6 +638,7 @@ class LiveReactor:
         buf = self.smear.astype(np.uint8)
         self._blockmosh(buf, x0, y0, rw, rh, raw)
         self.smear = buf.astype(np.float32)
+        self.burst_pos = (x, y)
         self._hit(rw * rh * 3 / 1e6)
         self._impact_anim(x, y, name, big=False)
         self.status.set(f"injected {name} at ({x},{y}) - {self.rng.choice(QUIPS)}")
@@ -720,22 +732,48 @@ class LiveReactor:
 
         if self.real:
             return out          # real mode: what the decoder says, you see
-        if self.fuel and rng.random() < chaos * 0.6:
-            rw = max(16, rng.randint(w // 10, w // 3) // 8 * 8)
-            rh = rng.randint(h // 12, h // 4)
-            x, y = rng.randint(0, w - rw), rng.randint(0, h - rh)
-            name, raw = self.fuel.grab(rw * rh * 3, rng)
-            self._blockmosh(out, x, y, rw, rh, raw)
-            self.score_mb += rw * rh * 3 / 2e6  # ambient damage half-scores
 
-        if rng.random() < chaos * 0.7:
-            y = rng.randint(0, h - h // 6)
-            band = slice(y, y + h // 6)
-            out[band, :, 0] = np.roll(out[band, :, 0], rng.randint(4, 40), axis=1)
-        if rng.random() < chaos * 0.5:
-            y = rng.randint(0, h - h // 8)
-            out[y:y + h // 8] = np.roll(out[y:y + h // 8],
-                                        rng.randint(-w // 3, w // 3), axis=1)
+        # auto-chaos occasionally sparks a small burst of its own
+        if self.burst == 0 and chaos > 0 and rng.random() < chaos * 0.03:
+            self.burst = rng.randint(4, 8)
+            self.burst_pos = (rng.randint(0, w), rng.randint(0, h))
+            self.audio_blast_until = time.monotonic() + 0.3
+
+        # ------- the burst: movie-style glitch, then snap back clean -------
+        if self.burst > 0:
+            self.burst -= 1
+            bx, by = self.burst_pos
+            # sometimes the picture STICKS on a frame mid-burst
+            if self.frozen is not None and rng.random() < 0.6:
+                out = self.frozen.copy()
+            elif rng.random() < 0.35:
+                self.frozen = out.copy()
+            # RGB channels rip apart
+            dx = rng.randint(4, 18)
+            out[..., 0] = np.roll(out[..., 0], dx, axis=1)
+            out[..., 2] = np.roll(out[..., 2], -dx, axis=1)
+            # horizontal slices tear sideways, worst near the impact point
+            for _ in range(rng.randint(3, 7)):
+                sy = min(max(int(rng.gauss(by, h / 5)), 0), h - 8)
+                sh = rng.randint(2, 10)
+                out[sy:sy + sh] = np.roll(out[sy:sy + sh],
+                                          rng.randint(-w // 4, w // 4), axis=1)
+            # a couple of shattered blocks made of the frame's own content
+            if self.fuel and rng.random() < 0.7:
+                rw = max(24, min(w // 4, 96)) // 8 * 8
+                rh = rng.randint(12, h // 5)
+                x = min(max(bx + rng.randint(-w // 5, w // 5), 0), w - rw)
+                y = min(max(by + rng.randint(-h // 5, h // 5), 0), h - rh)
+                _, raw = self.fuel.grab(rw * rh * 3, rng)
+                self._blockmosh(out, x, y, rw, rh, raw)
+            # exposure flicker + the occasional thin white scanline
+            out = (out.astype(np.float32) *
+                   (0.75 if rng.random() < 0.5 else 1.25)).clip(0, 255).astype(np.uint8)
+            if rng.random() < 0.5:
+                sy = rng.randint(0, h - 2)
+                out[sy:sy + 1] = 235
+            if self.burst == 0:
+                self.frozen = None      # snap back to clean playback
 
         self.smear = self.smear * 0.7 + out.astype(np.float32) * 0.3
         return out
