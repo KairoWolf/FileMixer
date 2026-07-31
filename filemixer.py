@@ -640,7 +640,9 @@ def datamosh(paths, out_path, intensity=60.0, seed=0, on_progress=None):
 
     # more intensity = more frequent keyframes to drop = more smearing
     gop = max(8, int(48 - i / 3))
-    p_drop = 0.35 + i / 155          # chance each later keyframe gets dropped
+    # cap below 1.0: at 100% drop the video decays into a frozen smear,
+    # which reads as static — a few surviving keyframes keep it ALIVE
+    p_drop = min(0.92, 0.35 + i / 155)
     tmp = out_path + ".gop.mp4"
     try:
         # step 1: re-encode with regular keyframes and no scene-cut extras
