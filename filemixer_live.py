@@ -319,11 +319,11 @@ class LiveReactor:
 
         ctl = tk.Frame(self.root, bg=BG)
         ctl.pack(fill="x", padx=10, pady=2)
-        tk.Label(ctl, text="Chaos:", bg=BG, fg=FG).pack(side="left")
-        self.chaos = tk.DoubleVar(value=25)
+        tk.Label(ctl, text="Auto-chaos:", bg=BG, fg=FG).pack(side="left")
+        self.chaos = tk.DoubleVar(value=0)
         ttk.Scale(ctl, from_=0, to=100, variable=self.chaos, length=120).pack(side="left", padx=4)
         tk.Label(ctl, text="Smear:", bg=BG, fg=FG).pack(side="left", padx=(10, 0))
-        self.smear_amt = tk.DoubleVar(value=40)
+        self.smear_amt = tk.DoubleVar(value=0)
         ttk.Scale(ctl, from_=0, to=95, variable=self.smear_amt, length=120).pack(side="left", padx=4)
         self.audio_var = tk.BooleanVar(value=True)
         tk.Checkbutton(ctl, text="audio", variable=self.audio_var, bg=BG, fg=FG,
@@ -340,9 +340,9 @@ class LiveReactor:
         ttk.Button(row, text="Snapshot", command=self.snapshot).pack(side="left")
 
         self.status = tk.StringVar(
-            value="Load a video and a fuel folder, then click the PREVIEW window "
-                  "to inject at that position. Drag it to a second monitor if "
-                  "you like. All sources read-only.")
+            value="Load a video + fuel folder. It plays CLEAN until you strike "
+                  "it: click the preview to inject there. Auto-chaos makes the "
+                  "reactor damage things by itself; Smear adds melt trails.")
         tk.Label(self.root, textvariable=self.status, bg=BG, fg=HACK,
                  font=("Monospace", 9), anchor="w", padx=10, pady=4,
                  wraplength=520, justify="left").pack(fill="x")
@@ -374,7 +374,8 @@ class LiveReactor:
         self.canvas.config(width=dec.w, height=dec.h)
         self.vid_btn.config(text=os.path.basename(path))
         self.status.set(f"loaded {os.path.basename(path)} ({dec.w}x{dec.h} @ "
-                        f"{dec.fps}fps, looping) - click the frame to inject")
+                        f"{dec.fps}fps, looping) - playing clean. every glitch "
+                        "from here on is one you caused.")
         self._restart_audio()
         if not self.running:
             self.running = True
