@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""FileMixer LIVE - the live reactor.
+"""FileMixer LIVE - the live reactor, game edition.
 
-Plays a video and chucks random files into it IN REAL TIME: raw bytes of
-fuel files splatter into the decoded frames, glitch bands rip across,
-and a smear buffer melts everything datamosh-style - all live, all in
-memory. Nothing is ever written to or read destructively from disk: the
-video is decoded read-only, fuel files are read read-only, and the
-corruption only ever exists in the pixels on screen.
+A video plays forever while you destroy it IN REAL TIME:
 
-Snapshot button saves the current frame as a PNG if you catch something
-beautiful. That's the only file this program ever creates.
+  click the video   -> chuck a random file's bytes AT that exact spot
+  drag across it    -> glitch-brush: smear and rip whatever you touch
+  SPACE / big button-> huge chuck with impact animation
+  U or Ctrl+Z       -> UNDO the last atrocity
+  Chaos slider      -> the reactor also damages things on its own
+  Smear slider      -> live datamosh trails
+
+The audio is corrupted live too: chucks blast the soundtrack with the
+chucked file's bytes, and high chaos bitcrushes and stutters it.
+
+IT IS COMPLETELY SAFE. Every file is opened read-only. All damage
+happens to decoded pixels and samples in memory, on their way to your
+screen and speakers. Close the window and nothing ever happened.
+The only file this program can create is a Snapshot PNG.
 """
 
 import os
-import queue
 import random
-import struct
+import shutil
 import subprocess
 import threading
 import time
@@ -31,8 +37,14 @@ PANEL = "#1e1e28"
 FG = "#e8e8f0"
 ACCENT = "#ff5f87"
 HACK = "#4fee6f"
+WARN = "#ffd75f"
 
-VIEW_W = 512          # preview width; height follows the video's aspect
+VIEW_W = 512
+UNDO_DEPTH = 12
+
+RANKS = [(0, "unpaid intern"), (5, "reactor technician"), (20, "shift supervisor"),
+         (60, "safety inspector (fired)"), (150, "THE INCIDENT"),
+         (400, "walking exclusion zone"), (1000, "elephant's foot")]
 
 
 class Decoder:
@@ -68,15 +80,13 @@ class FuelPile:
 
     def __init__(self, folder):
         self.files = []
-        for root, _, names in os.walk(folder):
-            for n in names:
-                p = os.path.join(root, n)
-                try:
-                    if os.path.getsize(p) > 4096:
-                        self.files.append(p)
-                except OSError:
-                    pass
-            break  # top level only - no deep crawling through people's stuff
+        for n in os.listdir(folder):
+            p = os.path.join(folder, n)
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) > 4096:
+                    self.files.append(p)
+            except OSError:
+                pass
         if not self.files:
             raise ValueError("no usable files in that folder")
 
@@ -91,24 +101,92 @@ class FuelPile:
         return os.path.basename(path), np.frombuffer(data[:nbytes], dtype=np.uint8)
 
 
+class AudioMangler(threading.Thread):
+    """Decodes the video's audio and corrupts it live on the way to the
+    speakers: chuck blasts, chaos bitcrush, stutters. Read-only, of course."""
+
+    CHUNK = 8192  # bytes of s16 stereo ~ 46ms
+
+    def __init__(self, path, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.alive = True
+        self.dec = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-v", "quiet", "-stream_loop", "-1",
+             "-i", path, "-vn", "-f", "s16le", "-ar", "44100", "-ac", "2",
+             "pipe:1"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if shutil.which("aplay"):
+            sink_cmd = ["aplay", "-q", "-f", "S16_LE", "-r", "44100", "-c", "2"]
+        else:
+            sink_cmd = ["ffplay", "-nodisp", "-loglevel", "quiet", "-f", "s16le",
+                        "-ar", "44100", "-ac", "2", "-i", "pipe:0"]
+        self.sink = subprocess.Popen(sink_cmd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+        self.prev = None
+        self.rng = random.Random()
+
+    def run(self):
+        while self.alive:
+            raw = self.dec.stdout.read(self.CHUNK)
+            if not raw or len(raw) < self.CHUNK:
+                break
+            arr = np.frombuffer(raw, dtype=np.int16).copy()
+            chaos = self.app.chaos.get() / 100
+            try:
+                if time.monotonic() < self.app.audio_blast_until and self.app.fuel:
+                    # a chuck is landing: the file's bytes hit the speakers
+                    _, fb = self.app.fuel.grab(len(arr), self.rng)
+                    blast = (fb.astype(np.int16) - 128) * 90  # 8-bit scream
+                    arr = (arr // 2 + blast // 2).astype(np.int16)
+                elif chaos > 0.05 and self.rng.random() < chaos * 0.4:
+                    shift = 4 + int(chaos * 7)               # bitcrush
+                    arr = ((arr >> shift) << shift).astype(np.int16)
+                if self.prev is not None and self.rng.random() < chaos * 0.2:
+                    arr = self.prev                          # st-st-stutter
+            except Exception:
+                pass
+            self.prev = arr
+            try:
+                self.sink.stdin.write(arr.tobytes())
+            except (BrokenPipeError, OSError):
+                break
+
+    def stop(self):
+        self.alive = False
+        self.dec.kill()
+        self.sink.kill()
+
+
 class LiveReactor:
     def __init__(self, root):
         self.root = root
-        root.title("FileMixer LIVE :: the live reactor")
+        root.title("FileMixer LIVE :: reactor game")
         root.configure(bg=BG)
         root.resizable(False, False)
 
         self.rng = random.Random()
         self.decoder = None
         self.fuel = None
-        self.smear = None          # persistent float buffer = fake datamosh
+        self.smear = None
         self.photo = None
-        self.audio_proc = None
+        self.audio = None
+        self.video_path = None
         self.frames = 0
         self.running = False
+        self.audio_blast_until = 0.0
+
+        # game state
+        self.undo_stack = []
+        self.score_mb = 0.0
+        self.combo = 0
+        self.last_hit = 0.0
+        self.shake = 0
 
         self._build_ui()
 
+    # ------------------------------------------------------------------ UI
     def _build_ui(self):
         s = ttk.Style()
         s.theme_use("clam")
@@ -124,44 +202,58 @@ class LiveReactor:
         self.fuel_btn = ttk.Button(top, text="[ Choose fuel folder ]", command=self.pick_fuel)
         self.fuel_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        self.view = tk.Label(self.root, bg="#000000", bd=1, relief="solid")
-        self.view.pack(padx=10, pady=4)
-        self._blank_view()
+        # HUD
+        hud = tk.Frame(self.root, bg=BG)
+        hud.pack(fill="x", padx=10)
+        self.hud_score = tk.Label(hud, text="DESTRUCTION: 0.0 MB", bg=BG, fg=ACCENT,
+                                  font=("Monospace", 10, "bold"))
+        self.hud_score.pack(side="left")
+        self.hud_combo = tk.Label(hud, text="", bg=BG, fg=WARN,
+                                  font=("Monospace", 10, "bold"))
+        self.hud_combo.pack(side="left", padx=12)
+        self.hud_rank = tk.Label(hud, text="rank: unpaid intern", bg=BG, fg=HACK,
+                                 font=("Monospace", 9))
+        self.hud_rank.pack(side="right")
+
+        self.canvas = tk.Canvas(self.root, width=VIEW_W, height=288, bg="#000000",
+                                highlightthickness=1, highlightbackground=PANEL)
+        self.canvas.pack(padx=10, pady=4)
+        self.img_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.canvas.bind("<Button-1>", self.click_chuck)
+        self.canvas.bind("<B1-Motion>", self.drag_brush)
+        self.root.bind("<space>", lambda e: self.chuck_big())
+        self.root.bind("<u>", lambda e: self.undo())
+        self.root.bind("<Control-z>", lambda e: self.undo())
+        self._drag_gate = 0
 
         ctl = tk.Frame(self.root, bg=BG)
         ctl.pack(fill="x", padx=10, pady=2)
         tk.Label(ctl, text="Chaos:", bg=BG, fg=FG).pack(side="left")
-        self.chaos = tk.DoubleVar(value=35)
-        ttk.Scale(ctl, from_=0, to=100, variable=self.chaos,
-                  length=130).pack(side="left", padx=4)
+        self.chaos = tk.DoubleVar(value=25)
+        ttk.Scale(ctl, from_=0, to=100, variable=self.chaos, length=120).pack(side="left", padx=4)
         tk.Label(ctl, text="Smear:", bg=BG, fg=FG).pack(side="left", padx=(10, 0))
         self.smear_amt = tk.DoubleVar(value=40)
-        ttk.Scale(ctl, from_=0, to=95, variable=self.smear_amt,
-                  length=130).pack(side="left", padx=4)
+        ttk.Scale(ctl, from_=0, to=95, variable=self.smear_amt, length=120).pack(side="left", padx=4)
         self.audio_var = tk.BooleanVar(value=True)
         tk.Checkbutton(ctl, text="audio", variable=self.audio_var, bg=BG, fg=FG,
                        selectcolor=PANEL, activebackground=BG,
-                       command=self._toggle_audio).pack(side="right")
+                       command=self._restart_audio).pack(side="right")
 
         row = tk.Frame(self.root, bg=BG)
         row.pack(fill="x", padx=10, pady=4)
-        self.chuck_btn = ttk.Button(row, text="!! CHUCK A FILE IN NOW !!",
+        self.chuck_btn = ttk.Button(row, text="!! CHUCK A FILE IN !! (space)",
                                     style="Big.TButton", command=self.chuck_big,
                                     state="disabled")
         self.chuck_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ttk.Button(row, text="UNDO (u)", command=self.undo).pack(side="left", padx=(0, 4))
         ttk.Button(row, text="Snapshot", command=self.snapshot).pack(side="left")
 
         self.status = tk.StringVar(
-            value="Pick a video and a fuel folder. Everything stays read-only.")
+            value="Pick a video + fuel folder, then CLICK THE VIDEO to strike it. "
+                  "Files harmed so far: 0 (this number cannot go up)")
         tk.Label(self.root, textvariable=self.status, bg=BG, fg=HACK,
                  font=("Monospace", 9), anchor="w", padx=10, pady=4,
                  wraplength=520, justify="left").pack(fill="x")
-
-    def _blank_view(self):
-        img = tk.PhotoImage(width=VIEW_W, height=288)
-        img.put("#000000", to=(0, 0, VIEW_W, 288))
-        self.view.config(image=img)
-        self.view.img = img
 
     # ------------------------------------------------------------- setup
     def pick_video(self):
@@ -175,14 +267,15 @@ class LiveReactor:
             return
         if self.decoder:
             self.decoder.stop()
-        self._stop_audio()
         self.video_path = path
         self.decoder = dec
         self.smear = None
+        self.undo_stack.clear()
+        self.canvas.config(width=dec.w, height=dec.h)
         self.vid_btn.config(text=os.path.basename(path))
-        self.status.set(f"reactor loaded: {os.path.basename(path)} "
-                        f"({dec.w}x{dec.h} @ {dec.fps}fps, looping forever)")
-        self._toggle_audio()
+        self.status.set(f"reactor loaded: {os.path.basename(path)} - "
+                        "now CLICK IT. drag across it. show it no mercy.")
+        self._restart_audio()
         if not self.running:
             self.running = True
             self._tick()
@@ -198,78 +291,162 @@ class LiveReactor:
             self.status.set(str(e))
             return
         self.fuel_btn.config(text=f"{os.path.basename(folder)} ({len(self.fuel.files)} files)")
-        self.status.set(f"fuel pile armed: {len(self.fuel.files)} files, read-only")
+        self.status.set(f"fuel pile armed: {len(self.fuel.files)} files (read-only, "
+                        "they will all survive)")
         self._maybe_arm()
 
     def _maybe_arm(self):
         if self.decoder and self.fuel:
             self.chuck_btn.config(state="normal")
 
-    def _toggle_audio(self):
-        self._stop_audio()
-        if self.audio_var.get() and self.decoder:
-            self.audio_proc = subprocess.Popen(
-                ["ffplay", "-nodisp", "-loglevel", "quiet", "-loop", "0",
-                 self.video_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def _restart_audio(self):
+        if self.audio:
+            self.audio.stop()
+            self.audio = None
+        if self.audio_var.get() and self.video_path:
+            try:
+                self.audio = AudioMangler(self.video_path, self)
+                self.audio.start()
+            except OSError:
+                self.status.set("audio device unavailable - running silent")
 
-    def _stop_audio(self):
-        if self.audio_proc:
-            self.audio_proc.kill()
-            self.audio_proc = None
+    # -------------------------------------------------------- game logic
+    def _push_undo(self):
+        if self.smear is not None:
+            self.undo_stack.append(self.smear.copy())
+            if len(self.undo_stack) > UNDO_DEPTH:
+                self.undo_stack.pop(0)
+
+    def undo(self):
+        if not self.undo_stack:
+            self.status.set("nothing to undo - the reactor is at peace")
+            return
+        self.smear = self.undo_stack.pop()
+        self.status.set("UNDONE. like it never happened. "
+                        f"({len(self.undo_stack)} more undos stacked)")
+
+    def _hit(self, mb):
+        now = time.monotonic()
+        self.combo = self.combo + 1 if now - self.last_hit < 2.5 else 1
+        self.last_hit = now
+        self.score_mb += mb
+        self.shake = 6
+        self.audio_blast_until = now + 0.4
+        self.hud_score.config(text=f"DESTRUCTION: {self.score_mb:.1f} MB")
+        self.hud_combo.config(text=f"COMBO x{self.combo}!" if self.combo > 1 else "")
+        rank = [r for m, r in RANKS if self.score_mb >= m][-1]
+        self.hud_rank.config(text=f"rank: {rank}")
+
+    # ------------------------------------------------------ interactions
+    def click_chuck(self, event):
+        if not (self.fuel and self.smear is not None):
+            return
+        self._push_undo()
+        h, w, _ = self.smear.shape
+        x = min(max(event.x, 0), w - 1)
+        y = min(max(event.y, 0), h - 1)
+        rw, rh = self.rng.randint(w // 6, w // 3), self.rng.randint(h // 6, h // 3)
+        x0, y0 = max(0, x - rw // 2), max(0, y - rh // 2)
+        rw, rh = min(rw, w - x0), min(rh, h - y0)
+        name, raw = self.fuel.grab(rw * rh * 3, self.rng)
+        self.smear[y0:y0 + rh, x0:x0 + rw] = \
+            raw.reshape(rh, rw, 3).astype(np.float32)
+        self._hit(rw * rh * 3 / 1e6)
+        self._impact_anim(x, y, name, big=False)
+
+    def drag_brush(self, event):
+        if self.smear is None:
+            return
+        self._drag_gate += 1
+        if self._drag_gate % 2:   # every other motion event is plenty
+            return
+        h, w, _ = self.smear.shape
+        y = min(max(event.y, 12), h - 13)
+        band = self.smear[y - 12:y + 12]
+        self.smear[y - 12:y + 12] = np.roll(band, self.rng.randint(-60, 60), axis=1)
+        if self.fuel and self.rng.random() < 0.3:
+            _, raw = self.fuel.grab(w * 2 * 3, self.rng)
+            self.smear[y:y + 2] = raw.reshape(2, w, 3).astype(np.float32)
+            self.score_mb += w * 2 * 3 / 1e6
+
+    def chuck_big(self):
+        if not (self.fuel and self.smear is not None):
+            return
+        self._push_undo()
+        h, w, _ = self.smear.shape
+        name, raw = self.fuel.grab(w * (h // 2) * 3, self.rng)
+        y = self.rng.randint(0, h - h // 2)
+        self.smear[y:y + h // 2] = raw.reshape(h // 2, w, 3).astype(np.float32)
+        self._hit(w * (h // 2) * 3 / 1e6)
+        self._impact_anim(w // 2, y + h // 4, name, big=True)
+
+    # -------------------------------------------------------- animations
+    def _impact_anim(self, x, y, name, big):
+        c = self.canvas
+        edge = self.rng.choice([(0, self.rng.randint(0, c.winfo_height())),
+                                (c.winfo_width(), self.rng.randint(0, c.winfo_height())),
+                                (self.rng.randint(0, c.winfo_width()), 0)])
+        streak = c.create_line(*edge, x, y, fill=WARN, width=3 if big else 2)
+        label = c.create_text(x, y - 14, text=f">> {name} <<", fill="#ffffff",
+                              font=("Monospace", 11 if big else 9, "bold"))
+        rings = []
+        self.root.after(120, lambda: c.delete(streak))
+
+        def ring(step=0):
+            if step > (7 if big else 5):
+                for r in rings:
+                    c.delete(r)
+                return
+            r = c.create_oval(x - step * 14, y - step * 14,
+                              x + step * 14, y + step * 14,
+                              outline=ACCENT if step % 2 else WARN,
+                              width=max(1, 4 - step // 2))
+            rings.append(r)
+            if len(rings) > 2:
+                c.delete(rings.pop(0))
+            self.root.after(40, lambda: ring(step + 1))
+        ring()
+
+        def floatup(step=0):
+            if step > 16:
+                c.delete(label)
+                return
+            c.move(label, 0, -2)
+            self.root.after(45, lambda: floatup(step + 1))
+        floatup()
 
     # ------------------------------------------------------- the reactor
     def _corrupt(self, frame):
-        """All the damage happens HERE, to a copy of decoded pixels."""
         f = frame.astype(np.float32)
         h, w, _ = frame.shape
         chaos = self.chaos.get() / 100
         rng = self.rng
 
-        # persistent smear = live fake datamosh
         alpha = 1.0 - self.smear_amt.get() / 100
         if self.smear is None:
             self.smear = f.copy()
         self.smear = self.smear * (1 - alpha) + f * alpha
         out = self.smear.astype(np.uint8).copy()
 
-        # random byte splats from the fuel pile
-        if self.fuel and rng.random() < chaos:
-            for _ in range(1 + int(chaos * 3)):
-                rw = rng.randint(w // 8, w // 2)
-                rh = rng.randint(h // 10, h // 3)
-                x, y = rng.randint(0, w - rw), rng.randint(0, h - rh)
-                name, raw = self.fuel.grab(rw * rh * 3, rng)
-                out[y:y + rh, x:x + rw] = raw.reshape(rh, rw, 3)
-                self.last_chuck = name
+        if self.fuel and rng.random() < chaos * 0.6:
+            rw = rng.randint(w // 10, w // 3)
+            rh = rng.randint(h // 12, h // 4)
+            x, y = rng.randint(0, w - rw), rng.randint(0, h - rh)
+            name, raw = self.fuel.grab(rw * rh * 3, rng)
+            out[y:y + rh, x:x + rw] = raw.reshape(rh, rw, 3)
+            self.score_mb += rw * rh * 3 / 2e6  # ambient damage half-scores
 
-        # channel-shift band
         if rng.random() < chaos * 0.7:
             y = rng.randint(0, h - h // 6)
             band = slice(y, y + h // 6)
             out[band, :, 0] = np.roll(out[band, :, 0], rng.randint(4, 40), axis=1)
-
-        # row displacement rip
         if rng.random() < chaos * 0.5:
             y = rng.randint(0, h - h // 8)
             out[y:y + h // 8] = np.roll(out[y:y + h // 8],
                                         rng.randint(-w // 3, w // 3), axis=1)
 
-        # keep the smear buffer contaminated so damage lingers and melts
         self.smear = self.smear * 0.7 + out.astype(np.float32) * 0.3
         return out
-
-    def chuck_big(self):
-        """The button: a huge splat right now."""
-        if not (self.fuel and self.smear is not None):
-            return
-        h, w, _ = self.smear.shape
-        name, raw = self.fuel.grab(w * (h // 2) * 3, self.rng)
-        splat = raw.reshape(h // 2, w, 3).astype(np.float32)
-        y = self.rng.randint(0, h - h // 2)
-        self.smear[y:y + h // 2] = splat
-        self.status.set(f">> CHUCKED: {name} (its bytes are now pixels. "
-                        "the file itself is fine.)")
 
     def snapshot(self):
         if self.smear is None:
@@ -293,8 +470,15 @@ class LiveReactor:
             h, w, _ = out.shape
             ppm = b"P6\n%d %d\n255\n" % (w, h) + out.tobytes()
             self.photo = tk.PhotoImage(data=ppm)
-            self.view.config(image=self.photo)
+            self.canvas.itemconfig(self.img_item, image=self.photo)
+            if self.shake > 0:  # impact screen shake
+                self.canvas.coords(self.img_item,
+                                   self.rng.randint(-6, 6), self.rng.randint(-6, 6))
+                self.shake -= 1
+            else:
+                self.canvas.coords(self.img_item, 0, 0)
             self.frames += 1
+            self.hud_score.config(text=f"DESTRUCTION: {self.score_mb:.1f} MB")
         delay = max(1, int((1 / self.decoder.fps - (time.monotonic() - t0)) * 1000)) \
             if self.decoder else 50
         self.root.after(delay, self._tick)
@@ -303,7 +487,8 @@ class LiveReactor:
         self.running = False
         if self.decoder:
             self.decoder.stop()
-        self._stop_audio()
+        if self.audio:
+            self.audio.stop()
 
 
 def main():
