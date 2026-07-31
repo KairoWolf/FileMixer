@@ -770,7 +770,7 @@ def _remix_video_visual(a, b, kb, out, i, rng, on_progress=None):
     if not dur or not dims:
         raise ValueError("couldn't read the video's duration/size")
     aw, ah = dims
-    flashes = min(16, max(2, int(2 + i / 6)))
+    flashes = min(36, max(2, int(2 + i / 4)))
     # few overlay branches, many time-windows each: 16 parallel branches of
     # a looped video buffer enough frames to get ffmpeg OOM-killed
     n = min(4, flashes)
@@ -813,11 +813,11 @@ def _remix_audio_bursts(a, b, bkind, out, i, rng, video):
         b_input = ["-stream_loop", "-1", "-i", b]
     else:  # interpret B's raw bytes as 8-bit audio — literal data as sound
         b_input = ["-f", "u8", "-ar", "44100", "-stream_loop", "-1", "-i", b]
-    period = max(0.8, dur / (2 + i / 8))
+    period = max(0.6, dur / (2 + i / 5))
     burst = min(period * 0.8, 0.15 + i / 80)
     phase = rng.random() * period
     gate = (f"[1:a]volume='if(lt(mod(t+{phase:.2f},{period:.2f}),{burst:.2f}),"
-            f"{0.4 + i / 200:.2f},0)':eval=frame[g]")
+            f"{0.5 + i / 120:.2f},0)':eval=frame[g]")
     mix = f"{gate};[0:a][g]amix=inputs=2:duration=first:normalize=0[aout]"
     if video:
         args = (["-i", a] + b_input +
