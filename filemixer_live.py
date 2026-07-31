@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""FileMixer LIVE - the live reactor, game edition.
+"""FileMixer LIVE - realtime corruption console.
+
+Two windows: the CONSOLE (controls + telemetry) and the PREVIEW (the
+live video frame) - drag the preview to a second monitor if you have
+one; strikes land wherever you click it.
 
 A video plays forever while you destroy it IN REAL TIME:
 
@@ -19,9 +23,11 @@ screen and speakers. Close the window and nothing ever happened.
 The only file this program can create is a Snapshot PNG.
 """
 
+import ctypes
 import os
 import random
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -42,10 +48,15 @@ WARN = "#ffd75f"
 VIEW_W = 512
 UNDO_DEPTH = 12
 
-RANKS = [(0, "unpaid intern"), (5, "reactor technician"), (20, "shift supervisor"),
-         (60, "safety inspector (fired)"), (150, "THE INCIDENT"),
-         (400, "walking exclusion zone"), (1000, "elephant's foot")]
 
+def _dies_with_us():
+    """preexec for child processes: SIGKILL them the instant this program
+    dies, however it dies. No more immortal songs haunting the desktop."""
+    ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+
+
+def popen(cmd, **kw):
+    return subprocess.Popen(cmd, preexec_fn=_dies_with_us, **kw)
 
 class Decoder:
     """Loops a video forever through ffmpeg, yielding raw RGB frames."""
@@ -58,7 +69,7 @@ class Decoder:
         self.w = width
         self.h = max(2, int(width * h / w)) // 2 * 2
         self.fps = 20
-        self.proc = subprocess.Popen(
+        self.proc = popen(
             ["ffmpeg", "-nostdin", "-v", "error", "-stream_loop", "-1",
              "-i", path, "-f", "rawvideo", "-pix_fmt", "rgb24",
              "-vf", f"scale={self.w}:{self.h},fps={self.fps}", "pipe:1"],
@@ -111,7 +122,7 @@ class AudioMangler(threading.Thread):
         super().__init__(daemon=True)
         self.app = app
         self.alive = True
-        self.dec = subprocess.Popen(
+        self.dec = popen(
             ["ffmpeg", "-nostdin", "-v", "quiet", "-stream_loop", "-1",
              "-i", path, "-vn", "-f", "s16le", "-ar", "44100", "-ac", "2",
              "pipe:1"],
@@ -121,7 +132,7 @@ class AudioMangler(threading.Thread):
         else:
             sink_cmd = ["ffplay", "-nodisp", "-loglevel", "quiet", "-f", "s16le",
                         "-ar", "44100", "-ac", "2", "-i", "pipe:0"]
-        self.sink = subprocess.Popen(sink_cmd, stdin=subprocess.PIPE,
+        self.sink = popen(sink_cmd, stdin=subprocess.PIPE,
                                      stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         self.prev = None
@@ -162,7 +173,7 @@ class AudioMangler(threading.Thread):
 class LiveReactor:
     def __init__(self, root):
         self.root = root
-        root.title("FileMixer LIVE :: reactor game")
+        root.title("FileMixer LIVE :: realtime corruption console")
         root.configure(bg=BG)
         root.resizable(False, False)
 
@@ -177,11 +188,10 @@ class LiveReactor:
         self.running = False
         self.audio_blast_until = 0.0
 
-        # game state
+        # session telemetry
         self.undo_stack = []
         self.score_mb = 0.0
-        self.combo = 0
-        self.last_hit = 0.0
+        self.events = 0
         self.shake = 0
 
         self._build_ui()
@@ -202,28 +212,34 @@ class LiveReactor:
         self.fuel_btn = ttk.Button(top, text="[ Choose fuel folder ]", command=self.pick_fuel)
         self.fuel_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        # HUD
+        # telemetry bar
         hud = tk.Frame(self.root, bg=BG)
         hud.pack(fill="x", padx=10)
-        self.hud_score = tk.Label(hud, text="DESTRUCTION: 0.0 MB", bg=BG, fg=ACCENT,
-                                  font=("Monospace", 10, "bold"))
+        self.hud_score = tk.Label(hud, text="injected 0.0 MB | 0 events", bg=BG,
+                                  fg="#9aa0b8", font=("Monospace", 9))
         self.hud_score.pack(side="left")
-        self.hud_combo = tk.Label(hud, text="", bg=BG, fg=WARN,
-                                  font=("Monospace", 10, "bold"))
-        self.hud_combo.pack(side="left", padx=12)
-        self.hud_rank = tk.Label(hud, text="rank: unpaid intern", bg=BG, fg=HACK,
-                                 font=("Monospace", 9))
-        self.hud_rank.pack(side="right")
+        tk.Label(hud, text="source integrity: 100% (read-only)", bg=BG, fg=HACK,
+                 font=("Monospace", 9)).pack(side="right")
 
-        self.canvas = tk.Canvas(self.root, width=VIEW_W, height=288, bg="#000000",
-                                highlightthickness=1, highlightbackground=PANEL)
-        self.canvas.pack(padx=10, pady=4)
+        # the preview is its own window - drag it to any monitor
+        self.preview = tk.Toplevel(self.root)
+        self.preview.title("FileMixer LIVE :: preview")
+        self.preview.configure(bg="#000000")
+        self.preview.resizable(False, False)
+        self.preview.protocol("WM_DELETE_WINDOW", self.root.destroy)
+        self.canvas = tk.Canvas(self.preview, width=VIEW_W, height=288,
+                                bg="#000000", highlightthickness=0)
+        self.canvas.pack()
         self.img_item = self.canvas.create_image(0, 0, anchor="nw")
         self.canvas.bind("<Button-1>", self.click_chuck)
         self.canvas.bind("<B1-Motion>", self.drag_brush)
-        self.root.bind("<space>", lambda e: self.chuck_big())
-        self.root.bind("<u>", lambda e: self.undo())
-        self.root.bind("<Control-z>", lambda e: self.undo())
+        for win in (self.root, self.preview):
+            win.bind("<space>", lambda e: self.chuck_big())
+            win.bind("<u>", lambda e: self.undo())
+            win.bind("<Control-z>", lambda e: self.undo())
+        # park the preview beside the console to start with
+        self.root.update_idletasks()
+        self.preview.geometry(f"+{self.root.winfo_x() + 420}+{self.root.winfo_y()}")
         self._drag_gate = 0
 
         ctl = tk.Frame(self.root, bg=BG)
@@ -241,7 +257,7 @@ class LiveReactor:
 
         row = tk.Frame(self.root, bg=BG)
         row.pack(fill="x", padx=10, pady=4)
-        self.chuck_btn = ttk.Button(row, text="!! CHUCK A FILE IN !! (space)",
+        self.chuck_btn = ttk.Button(row, text="INJECT FILE  (space)",
                                     style="Big.TButton", command=self.chuck_big,
                                     state="disabled")
         self.chuck_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
@@ -249,8 +265,9 @@ class LiveReactor:
         ttk.Button(row, text="Snapshot", command=self.snapshot).pack(side="left")
 
         self.status = tk.StringVar(
-            value="Pick a video + fuel folder, then CLICK THE VIDEO to strike it. "
-                  "Files harmed so far: 0 (this number cannot go up)")
+            value="Load a video and a fuel folder, then click the PREVIEW window "
+                  "to inject at that position. Drag it to a second monitor if "
+                  "you like. All sources read-only.")
         tk.Label(self.root, textvariable=self.status, bg=BG, fg=HACK,
                  font=("Monospace", 9), anchor="w", padx=10, pady=4,
                  wraplength=520, justify="left").pack(fill="x")
@@ -273,8 +290,8 @@ class LiveReactor:
         self.undo_stack.clear()
         self.canvas.config(width=dec.w, height=dec.h)
         self.vid_btn.config(text=os.path.basename(path))
-        self.status.set(f"reactor loaded: {os.path.basename(path)} - "
-                        "now CLICK IT. drag across it. show it no mercy.")
+        self.status.set(f"loaded {os.path.basename(path)} ({dec.w}x{dec.h} @ "
+                        f"{dec.fps}fps, looping) - click the frame to inject")
         self._restart_audio()
         if not self.running:
             self.running = True
@@ -291,8 +308,8 @@ class LiveReactor:
             self.status.set(str(e))
             return
         self.fuel_btn.config(text=f"{os.path.basename(folder)} ({len(self.fuel.files)} files)")
-        self.status.set(f"fuel pile armed: {len(self.fuel.files)} files (read-only, "
-                        "they will all survive)")
+        self.status.set(f"fuel loaded: {len(self.fuel.files)} files, opened "
+                        "read-only - originals guaranteed intact")
         self._maybe_arm()
 
     def _maybe_arm(self):
@@ -319,23 +336,19 @@ class LiveReactor:
 
     def undo(self):
         if not self.undo_stack:
-            self.status.set("nothing to undo - the reactor is at peace")
+            self.status.set("undo history empty - no modifications to revert")
             return
         self.smear = self.undo_stack.pop()
-        self.status.set("UNDONE. like it never happened. "
-                        f"({len(self.undo_stack)} more undos stacked)")
+        self.status.set(f"reverted last injection "
+                        f"({len(self.undo_stack)} undo levels remaining)")
 
     def _hit(self, mb):
-        now = time.monotonic()
-        self.combo = self.combo + 1 if now - self.last_hit < 2.5 else 1
-        self.last_hit = now
         self.score_mb += mb
-        self.shake = 6
-        self.audio_blast_until = now + 0.4
-        self.hud_score.config(text=f"DESTRUCTION: {self.score_mb:.1f} MB")
-        self.hud_combo.config(text=f"COMBO x{self.combo}!" if self.combo > 1 else "")
-        rank = [r for m, r in RANKS if self.score_mb >= m][-1]
-        self.hud_rank.config(text=f"rank: {rank}")
+        self.events += 1
+        self.shake = 3
+        self.audio_blast_until = time.monotonic() + 0.4
+        self.hud_score.config(
+            text=f"injected {self.score_mb:.1f} MB | {self.events} events")
 
     # ------------------------------------------------------ interactions
     def click_chuck(self, event):
@@ -383,36 +396,30 @@ class LiveReactor:
     # -------------------------------------------------------- animations
     def _impact_anim(self, x, y, name, big):
         c = self.canvas
-        edge = self.rng.choice([(0, self.rng.randint(0, c.winfo_height())),
-                                (c.winfo_width(), self.rng.randint(0, c.winfo_height())),
-                                (self.rng.randint(0, c.winfo_width()), 0)])
-        streak = c.create_line(*edge, x, y, fill=WARN, width=3 if big else 2)
-        label = c.create_text(x, y - 14, text=f">> {name} <<", fill="#ffffff",
-                              font=("Monospace", 11 if big else 9, "bold"))
+        label = c.create_text(x, y - 12, text=name, fill="#d8d8e8",
+                              font=("Monospace", 9 if big else 8))
         rings = []
-        self.root.after(120, lambda: c.delete(streak))
 
         def ring(step=0):
-            if step > (7 if big else 5):
+            if step > (5 if big else 4):
                 for r in rings:
                     c.delete(r)
                 return
-            r = c.create_oval(x - step * 14, y - step * 14,
-                              x + step * 14, y + step * 14,
-                              outline=ACCENT if step % 2 else WARN,
-                              width=max(1, 4 - step // 2))
+            r = c.create_oval(x - step * 12, y - step * 12,
+                              x + step * 12, y + step * 12,
+                              outline=ACCENT, width=1)
             rings.append(r)
-            if len(rings) > 2:
+            if len(rings) > 1:
                 c.delete(rings.pop(0))
-            self.root.after(40, lambda: ring(step + 1))
+            self.root.after(45, lambda: ring(step + 1))
         ring()
 
         def floatup(step=0):
-            if step > 16:
+            if step > 12:
                 c.delete(label)
                 return
-            c.move(label, 0, -2)
-            self.root.after(45, lambda: floatup(step + 1))
+            c.move(label, 0, -1.5)
+            self.root.after(50, lambda: floatup(step + 1))
         floatup()
 
     # ------------------------------------------------------- the reactor
@@ -473,12 +480,11 @@ class LiveReactor:
             self.canvas.itemconfig(self.img_item, image=self.photo)
             if self.shake > 0:  # impact screen shake
                 self.canvas.coords(self.img_item,
-                                   self.rng.randint(-6, 6), self.rng.randint(-6, 6))
+                                   self.rng.randint(-3, 3), self.rng.randint(-3, 3))
                 self.shake -= 1
             else:
                 self.canvas.coords(self.img_item, 0, 0)
             self.frames += 1
-            self.hud_score.config(text=f"DESTRUCTION: {self.score_mb:.1f} MB")
         delay = max(1, int((1 / self.decoder.fps - (time.monotonic() - t0)) * 1000)) \
             if self.decoder else 50
         self.root.after(delay, self._tick)
