@@ -25,6 +25,8 @@ The only file this program can create is a Snapshot PNG.
 
 import ctypes
 import os
+import struct
+import tempfile
 import random
 import shutil
 import signal
@@ -161,6 +163,86 @@ class AudioVizDecoder:
         self.proc.kill()
 
 
+def _find_mdat(path):
+    """Locate the mp4 media-payload box. Everything outside it (ftyp,
+    moov - the structure that makes the file playable) is off limits."""
+    size_total = os.path.getsize(path)
+    with open(path, "rb") as f:
+        pos = 0
+        while pos < size_total - 8:
+            f.seek(pos)
+            box_size, typ = struct.unpack(">I4s", f.read(8))
+            if box_size == 1:
+                box_size = struct.unpack(">Q", f.read(8))[0]
+                if typ == b"mdat":
+                    return pos + 16, box_size - 16
+            elif typ == b"mdat":
+                return pos + 8, box_size - 8
+            if box_size < 8:
+                break
+            pos += box_size
+    raise ValueError("no mdat box found")
+
+
+class RealFeed:
+    """REAL mode: a working COPY of the source (originals never touched)
+    whose actual bytes on disk get corrupted - but only inside the mdat
+    payload, never the container structure, so it can glitch but never
+    turn to static. The preview decoder reads this genuinely damaged file."""
+
+    def __init__(self, src, kind):
+        fd, self.tmp = tempfile.mkstemp(
+            suffix=".m4a" if kind == "audio" else ".mp4", prefix="fmlive_")
+        os.close(fd)
+        if kind == "audio":
+            fm._ffmpeg(["-i", src, "-c:a", "aac", "-movflags", "+faststart",
+                        self.tmp])
+        else:
+            fm._ffmpeg(["-i", src, "-c:v", "libx264", "-preset", "veryfast",
+                        "-g", "30", "-sc_threshold", "0", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-movflags", "+faststart", self.tmp])
+        self.mdat_start, self.mdat_size = _find_mdat(self.tmp)
+        self.duration = fm._probe_duration(self.tmp) or 1.0
+        self.patches = []       # one entry per strike, for undo
+
+    def strike(self, frac, fuel, rng, spots=35):
+        """Overwrite `spots` scattered runs of real bytes near the given
+        playback fraction with a fuel file's bytes. Returns the fuel name."""
+        guard = int(self.mdat_size * 0.03)   # first keyframe stays alive
+        lo, hi = self.mdat_start + guard, self.mdat_start + self.mdat_size - 600
+        center = self.mdat_start + int(self.mdat_size * min(max(frac, 0.04), 0.97))
+        name = "?"
+        applied = []
+        with open(self.tmp, "r+b") as f:
+            for _ in range(spots):
+                off = min(max(center + rng.randint(0, int(self.mdat_size * 0.03)),
+                              lo), hi)
+                ln = rng.randint(64, 512)
+                f.seek(off)
+                orig = f.read(ln)
+                name, raw = fuel.grab(ln, rng)
+                f.seek(off)
+                f.write(raw.tobytes())
+                applied.append((off, orig))
+        self.patches.append(applied)
+        return name
+
+    def undo(self):
+        if not self.patches:
+            return False
+        with open(self.tmp, "r+b") as f:
+            for off, orig in reversed(self.patches.pop()):
+                f.seek(off)
+                f.write(orig)
+        return True
+
+    def cleanup(self):
+        try:
+            os.remove(self.tmp)
+        except OSError:
+            pass
+
+
 class FuelPile:
     """Read-only grab-bag of random byte slices from a folder's files."""
 
@@ -219,9 +301,10 @@ class AudioMangler(threading.Thread):
             if not raw or len(raw) < self.CHUNK:
                 break
             arr = np.frombuffer(raw, dtype=np.int16).copy()
-            chaos = self.app.chaos.get() / 100
+            chaos = 0 if self.app.real else self.app.chaos.get() / 100
             try:
-                if time.monotonic() < self.app.audio_blast_until and self.app.fuel:
+                if (not self.app.real and self.app.fuel
+                        and time.monotonic() < self.app.audio_blast_until):
                     # a chuck is landing: the file's bytes hit the speakers
                     _, fb = self.app.fuel.grab(len(arr), self.rng)
                     blast = (fb.astype(np.int16) - 128) * 90  # 8-bit scream
@@ -259,6 +342,9 @@ class LiveReactor:
         self.photo = None
         self.audio = None
         self.video_path = None
+        self.src_kind = None
+        self.real = None            # RealFeed when in real mode
+        self.play_start = 0.0
         self.frames = 0
         self.running = False
         self.audio_blast_until = 0.0
@@ -319,6 +405,12 @@ class LiveReactor:
 
         ctl = tk.Frame(self.root, bg=BG)
         ctl.pack(fill="x", padx=10, pady=2)
+        tk.Label(ctl, text="Mode:", bg=BG, fg=FG).pack(side="left")
+        self.mode_var = tk.StringVar(value="instant")
+        mode_cb = ttk.Combobox(ctl, textvariable=self.mode_var, state="readonly",
+                               width=7, values=["instant", "real"])
+        mode_cb.pack(side="left", padx=(4, 10))
+        mode_cb.bind("<<ComboboxSelected>>", lambda e: self._apply_mode())
         tk.Label(ctl, text="Auto-chaos:", bg=BG, fg=FG).pack(side="left")
         self.chaos = tk.DoubleVar(value=0)
         ttk.Scale(ctl, from_=0, to=100, variable=self.chaos, length=120).pack(side="left", padx=4)
@@ -353,30 +445,28 @@ class LiveReactor:
         if not path:
             return
         kind = fm._probe_kind(path)
+        if kind not in ("audio", "video"):
+            self.status.set("need a video or audio file (images and byte "
+                            "soup can't drive the preview - yet)")
+            return
+        self.video_path = path
+        self.src_kind = kind
+        if self.real:
+            self.real.cleanup()
+            self.real = None
+        self.undo_stack.clear()
         try:
-            if kind == "audio":
-                dec = AudioVizDecoder(path, VIEW_W)
-            elif kind == "video":
-                dec = Decoder(path, VIEW_W)
+            if self.mode_var.get() == "real":
+                self._apply_mode()      # builds the working copy, then swaps
             else:
-                self.status.set("need a video or audio file (images and byte "
-                                "soup can't drive the preview - yet)")
-                return
+                self._swap_source(path)
         except (ValueError, OSError) as e:
             self.status.set(f"can't use that: {e}")
             return
-        if self.decoder:
-            self.decoder.stop()
-        self.video_path = path
-        self.decoder = dec
-        self.smear = None
-        self.undo_stack.clear()
-        self.canvas.config(width=dec.w, height=dec.h)
         self.vid_btn.config(text=os.path.basename(path))
-        self.status.set(f"loaded {os.path.basename(path)} ({dec.w}x{dec.h} @ "
-                        f"{dec.fps}fps, looping) - playing clean. every glitch "
-                        "from here on is one you caused.")
-        self._restart_audio()
+        if self.mode_var.get() != "real":
+            self.status.set(f"loaded {os.path.basename(path)} - playing clean. "
+                            "every glitch from here on is one you caused.")
         if not self.running:
             self.running = True
             self._tick()
@@ -396,17 +486,64 @@ class LiveReactor:
                         "read-only - originals guaranteed intact")
         self._maybe_arm()
 
+    def _apply_mode(self):
+        if not self.video_path:
+            return
+        if self.mode_var.get() == "real":
+            self.status.set("REAL mode: re-encoding a working copy (originals "
+                            "untouched) - the decoder will read genuinely "
+                            "damaged bytes ...")
+            threading.Thread(target=self._prepare_real, daemon=True).start()
+        else:
+            if self.real:
+                self.real.cleanup()
+                self.real = None
+            self._swap_source(self.video_path)
+            self.status.set("instant mode: damage is painted in memory, "
+                            "zero latency")
+
+    def _prepare_real(self):
+        try:
+            real = RealFeed(self.video_path, self.src_kind)
+        except (ValueError, RuntimeError, OSError) as e:
+            self.root.after(0, lambda: (self.mode_var.set("instant"),
+                                        self.status.set(f"real mode failed: {e}")))
+            return
+        self.real = real
+        self.root.after(0, lambda: (
+            self._swap_source(real.tmp),
+            self.status.set("REAL mode armed: this is a real decoder reading a "
+                            "real file whose bytes you are about to really "
+                            "damage. (container is protected - it can glitch "
+                            "but never die)")))
+
+    def _swap_source(self, path):
+        if self.decoder:
+            self.decoder.stop()
+        kind = self.src_kind
+        self.decoder = AudioVizDecoder(path, VIEW_W) if kind == "audio"             else Decoder(path, VIEW_W)
+        self.canvas.config(width=self.decoder.w, height=self.decoder.h)
+        self.smear = None
+        self.play_start = time.monotonic()
+        self._feed_path = path
+        self._restart_audio(path)
+
+    def _play_frac(self):
+        dur = self.real.duration if self.real else 1.0
+        return ((time.monotonic() - self.play_start) % dur) / dur
+
     def _maybe_arm(self):
         if self.decoder and self.fuel:
             self.chuck_btn.config(state="normal")
 
-    def _restart_audio(self):
+    def _restart_audio(self, path=None):
         if self.audio:
             self.audio.stop()
             self.audio = None
-        if self.audio_var.get() and self.video_path:
+        path = path or getattr(self, "_feed_path", self.video_path)
+        if self.audio_var.get() and path:
             try:
-                self.audio = AudioMangler(self.video_path, self)
+                self.audio = AudioMangler(path, self)
                 self.audio.start()
             except OSError:
                 self.status.set("audio device unavailable - running silent")
@@ -419,6 +556,13 @@ class LiveReactor:
                 self.undo_stack.pop(0)
 
     def undo(self):
+        if self.real:
+            if self.real.undo():
+                self.status.set("restored the original bytes of the last strike "
+                                "- future loops play that part clean again")
+            else:
+                self.status.set("no byte damage left to undo")
+            return
         if not self.undo_stack:
             self.status.set("undo history empty - no modifications to revert")
             return
@@ -463,6 +607,15 @@ class LiveReactor:
     def click_chuck(self, event):
         if not (self.fuel and self.smear is not None):
             return
+        if self.real:
+            frac = self._play_frac() + 1.2 / self.real.duration
+            name = self.real.strike(frac, self.fuel, self.rng)
+            self._hit(0.01)
+            self._impact_anim(event.x, event.y, name, big=False)
+            self.status.set(f"REAL bytes of the working copy damaged with "
+                            f"{name} - arriving on screen in about a second. "
+                            f"{self.rng.choice(QUIPS)}")
+            return
         self._push_undo()
         h, w, _ = self.smear.shape
         x = min(max(event.x, 0), w - 1)
@@ -482,6 +635,11 @@ class LiveReactor:
         if self.smear is None:
             return
         self._drag_gate += 1
+        if self.real:
+            if self.fuel and self._drag_gate % 6 == 0:
+                self.real.strike(self._play_frac() + 1.0 / self.real.duration,
+                                 self.fuel, self.rng, spots=6)
+            return
         if self._drag_gate % 2:   # every other motion event is plenty
             return
         h, w, _ = self.smear.shape
@@ -495,6 +653,14 @@ class LiveReactor:
 
     def chuck_big(self):
         if not (self.fuel and self.smear is not None):
+            return
+        if self.real:
+            frac = self._play_frac() + 1.2 / self.real.duration
+            name = self.real.strike(frac, self.fuel, self.rng, spots=140)
+            self._hit(0.05)
+            self._impact_anim(self.decoder.w // 2, self.decoder.h // 2, name, big=True)
+            self.status.set(f"bulk REAL damage: 140 byte-runs of {name} written "
+                            f"into the copy. {self.rng.choice(QUIPS)}")
             return
         self._push_undo()
         h, w, _ = self.smear.shape
@@ -552,6 +718,8 @@ class LiveReactor:
         self.smear = self.smear * (1 - alpha) + f * alpha
         out = self.smear.astype(np.uint8).copy()
 
+        if self.real:
+            return out          # real mode: what the decoder says, you see
         if self.fuel and rng.random() < chaos * 0.6:
             rw = max(16, rng.randint(w // 10, w // 3) // 8 * 8)
             rh = rng.randint(h // 12, h // 4)
@@ -589,6 +757,10 @@ class LiveReactor:
             return
         t0 = time.monotonic()
         frame = self.decoder.read() if self.decoder else None
+        if (self.real and self.fuel and self.chaos.get() > 0
+                and self.rng.random() < self.chaos.get() / 100 * 0.02):
+            self.real.strike(self._play_frac() + 1.5 / self.real.duration,
+                             self.fuel, self.rng, spots=8)
         if frame is not None:
             out = self._corrupt(frame)
             h, w, _ = out.shape
@@ -612,6 +784,8 @@ class LiveReactor:
             self.decoder.stop()
         if self.audio:
             self.audio.stop()
+        if self.real:
+            self.real.cleanup()
 
 
 def main():
