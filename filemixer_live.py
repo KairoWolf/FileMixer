@@ -49,6 +49,20 @@ VIEW_W = 512
 UNDO_DEPTH = 12
 
 
+QUIPS = [
+    "this is fine.",
+    "checksum has left the building",
+    "ERR_0xC0DEC: reality misaligned (non-fatal)",
+    "the codec is aware and has chosen violence",
+    "integrity report: physically fine, emotionally corrupted",
+    "motion vectors are now just vibes",
+    "packet arrived. from where? unclear.",
+    "warranty status: still valid (nothing was written)",
+    "the frame remembers what you did",
+    "entropy budget exceeded, borrowing from tomorrow",
+]
+
+
 def _dies_with_us():
     """preexec for child processes: SIGKILL them the instant this program
     dies, however it dies. No more immortal songs haunting the desktop."""
@@ -75,14 +89,75 @@ class Decoder:
              "-vf", f"scale={self.w}:{self.h},fps={self.fps}", "pipe:1"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.frame_bytes = self.w * self.h * 3
+        self.latest = None
+        self.alive = True
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        # decoding happens here so a starving pipe can never freeze the UI
+        while self.alive:
+            data = self.proc.stdout.read(self.frame_bytes)
+            if not data or len(data) < self.frame_bytes:
+                time.sleep(0.05)
+                continue
+            self.latest = np.frombuffer(data, dtype=np.uint8).reshape(
+                self.h, self.w, 3)
 
     def read(self):
-        data = self.proc.stdout.read(self.frame_bytes)
-        if len(data) < self.frame_bytes:
-            return None
-        return np.frombuffer(data, dtype=np.uint8).reshape(self.h, self.w, 3)
+        return self.latest
 
     def stop(self):
+        self.alive = False
+        self.proc.kill()
+
+
+class AudioVizDecoder:
+    """For audio files: renders a live scrolling visual from the decoded
+    samples (waveform over byte-colored history) - which then gets
+    corrupted exactly like video. Same interface as Decoder."""
+
+    def __init__(self, path, width):
+        self.w, self.h = width, 288
+        self.fps = 20
+        self.spf = 22050 // self.fps          # samples per frame
+        self.proc = popen(
+            ["ffmpeg", "-nostdin", "-v", "quiet", "-stream_loop", "-1",
+             "-i", path, "-vn", "-f", "s16le", "-ar", "22050", "-ac", "1",
+             "pipe:1"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.buf = np.zeros((self.h, self.w, 3), dtype=np.uint8)
+        self.latest = None
+        self.alive = True
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        while self.alive:
+            t0 = time.monotonic()
+            raw = self.proc.stdout.read(self.spf * 2)
+            if not raw or len(raw) < self.spf * 2:
+                time.sleep(0.05)
+                continue
+            smp = np.frombuffer(raw, dtype=np.int16)
+            self.buf = np.roll(self.buf, -3, axis=0)
+            # bottom rows: the samples' raw bytes as color history
+            bytes_row = np.frombuffer(raw, dtype=np.uint8)[: self.w * 3]
+            if len(bytes_row) < self.w * 3:
+                bytes_row = np.pad(bytes_row, (0, self.w * 3 - len(bytes_row)))
+            self.buf[-3:] = bytes_row.reshape(1, self.w, 3)
+            frame = self.buf.copy()
+            # the waveform itself
+            xs = np.linspace(0, len(smp) - 1, self.w).astype(int)
+            ys = (self.h // 2 + (smp[xs].astype(np.int32) * (self.h // 3)
+                                 // 32768)).clip(1, self.h - 2)
+            frame[ys, np.arange(self.w)] = (127, 255, 160)
+            frame[ys - 1, np.arange(self.w)] = (40, 160, 90)
+            self.latest = frame
+            time.sleep(max(0.0, 1 / self.fps - (time.monotonic() - t0)))
+
+    def read(self):
+        return self.latest
+
+    def stop(self):
+        self.alive = False
         self.proc.kill()
 
 
@@ -277,8 +352,16 @@ class LiveReactor:
         path = filedialog.askopenfilename(title="Choose a video to torment")
         if not path:
             return
+        kind = fm._probe_kind(path)
         try:
-            dec = Decoder(path, VIEW_W)
+            if kind == "audio":
+                dec = AudioVizDecoder(path, VIEW_W)
+            elif kind == "video":
+                dec = Decoder(path, VIEW_W)
+            else:
+                self.status.set("need a video or audio file (images and byte "
+                                "soup can't drive the preview - yet)")
+                return
         except (ValueError, OSError) as e:
             self.status.set(f"can't use that: {e}")
             return
@@ -350,6 +433,31 @@ class LiveReactor:
         self.hud_score.config(
             text=f"injected {self.score_mb:.1f} MB | {self.events} events")
 
+    def _blockmosh(self, out, x0, y0, rw, rh, raw):
+        """Codec-style damage: the region is rebuilt from a displaced copy
+        of the frame itself (motion vectors gone wrong), the fuel's bytes
+        bleed through it, 8px strips get scrambled, and sometimes the
+        decoder-panic green washes over. Looks like real corruption
+        because it's built from the frame's own content."""
+        h, w, _ = out.shape
+        rng = self.rng
+        sy = min(max(y0 + rng.randint(-h // 4, h // 4), 0), h - rh)
+        sx = min(max(x0 + rng.randint(-w // 4, w // 4), 0), w - rw)
+        src = out[sy:sy + rh, sx:sx + rw].astype(np.float32)
+        fuel = raw.reshape(rh, rw, 3).astype(np.float32)
+        region = src * 0.6 + fuel * 0.4
+        # scramble vertical 8px strips like shattered macroblocks
+        strips = [region[:, i:i + 8] for i in range(0, rw - 7, 8)]
+        if len(strips) > 1:
+            rng.shuffle(strips)
+            region[:, :len(strips) * 8] = np.concatenate(strips, axis=1)
+        # chroma bleed: green/pink decoder panic
+        if rng.random() < 0.3:
+            region[..., 1] = np.minimum(region[..., 1] * 1.6 + 40, 255)
+        elif rng.random() < 0.3:
+            region[..., 0] = np.minimum(region[..., 0] * 1.5 + 30, 255)
+        out[y0:y0 + rh, x0:x0 + rw] = region.astype(np.uint8)
+
     # ------------------------------------------------------ interactions
     def click_chuck(self, event):
         if not (self.fuel and self.smear is not None):
@@ -362,10 +470,12 @@ class LiveReactor:
         x0, y0 = max(0, x - rw // 2), max(0, y - rh // 2)
         rw, rh = min(rw, w - x0), min(rh, h - y0)
         name, raw = self.fuel.grab(rw * rh * 3, self.rng)
-        self.smear[y0:y0 + rh, x0:x0 + rw] = \
-            raw.reshape(rh, rw, 3).astype(np.float32)
+        buf = self.smear.astype(np.uint8)
+        self._blockmosh(buf, x0, y0, rw, rh, raw)
+        self.smear = buf.astype(np.float32)
         self._hit(rw * rh * 3 / 1e6)
         self._impact_anim(x, y, name, big=False)
+        self.status.set(f"injected {name} at ({x},{y}) - {self.rng.choice(QUIPS)}")
 
     def drag_brush(self, event):
         if self.smear is None:
@@ -387,11 +497,17 @@ class LiveReactor:
             return
         self._push_undo()
         h, w, _ = self.smear.shape
-        name, raw = self.fuel.grab(w * (h // 2) * 3, self.rng)
-        y = self.rng.randint(0, h - h // 2)
-        self.smear[y:y + h // 2] = raw.reshape(h // 2, w, 3).astype(np.float32)
+        buf = self.smear.astype(np.uint8)
+        name = "?"
+        for _ in range(3):
+            rh = h // 5
+            y = self.rng.randint(0, h - rh)
+            name, raw = self.fuel.grab(w * rh * 3, self.rng)
+            self._blockmosh(buf, 0, y, w, rh, raw)
+        self.smear = buf.astype(np.float32)
         self._hit(w * (h // 2) * 3 / 1e6)
-        self._impact_anim(w // 2, y + h // 4, name, big=True)
+        self._impact_anim(w // 2, h // 2, name, big=True)
+        self.status.set(f"bulk injection: {name} - {self.rng.choice(QUIPS)}")
 
     # -------------------------------------------------------- animations
     def _impact_anim(self, x, y, name, big):
@@ -436,11 +552,11 @@ class LiveReactor:
         out = self.smear.astype(np.uint8).copy()
 
         if self.fuel and rng.random() < chaos * 0.6:
-            rw = rng.randint(w // 10, w // 3)
+            rw = max(16, rng.randint(w // 10, w // 3) // 8 * 8)
             rh = rng.randint(h // 12, h // 4)
             x, y = rng.randint(0, w - rw), rng.randint(0, h - rh)
             name, raw = self.fuel.grab(rw * rh * 3, rng)
-            out[y:y + rh, x:x + rw] = raw.reshape(rh, rw, 3)
+            self._blockmosh(out, x, y, rw, rh, raw)
             self.score_mb += rw * rh * 3 / 2e6  # ambient damage half-scores
 
         if rng.random() < chaos * 0.7:
